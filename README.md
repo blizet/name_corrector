@@ -1,7 +1,6 @@
 # Name Correction Service
 
-An HTTP backend that corrects ASR-mangled names.  
-Retell calls it as a **Custom Function Tool** — zero custom code inside Retell.
+An HTTP backend that corrects ASR-mangled names and returns **recovery routing** for voice agents (e.g. Retell).
 
 ---
 
@@ -13,7 +12,7 @@ npm install
 npm start          # listens on PORT (default 3000)
 ```
 
-Set `PORT` env var to change the port.
+Optional: set `OPENAI_API_KEY` for a **time-bounded** LLM rerank when local confidence is **low** only (keeps happy paths fast).
 
 ---
 
@@ -21,71 +20,74 @@ Set `PORT` env var to change the port.
 
 ### `POST /correct-name` (or `GET` with query string)
 
-**Request** — only these two fields are needed (JSON body and/or query params; POST merges both):
+**Request** — required:
 
 ```json
 { "first_name": "suzan", "last_name": "obrien" }
 ```
 
-In Retell (no trailing comma after the last property):
+Optional (for progressive recovery — pass from your voice flow on retries):
 
-```json
-{ "first_name": "{{first_name}}", "last_name": "{{last_name}}" }
-```
+| Field | Description |
+|-------|-------------|
+| `attempt_number` | `1` first time, then `2`, `3`, … (query or JSON; POST merges body + query) |
 
-**Response** — four fields only:
+**Response** — compact JSON:
 
 ```json
 {
   "first_name": "Susan",
   "last_name": "O'Brien",
   "full_name": "Susan O'Brien",
-  "low_confidence_flag": false
+  "confidence": "high",
+  "low_confidence_flag": false,
+  "next_action": "confirm",
+  "recovery_strategy": "phonetic_map_hit"
 }
 ```
 
-`low_confidence_flag` is `true` when the engine is unsure (weak side of first vs last confidence). Use it in Retell to branch to a spell-out or softer confirm path.
+### `confidence`
+
+`high` \| `medium` \| `low` — conservative aggregate of first + last (worst side wins).
+
+### `next_action`
+
+One of:
+
+| Value | When (deterministic) |
+|-------|----------------------|
+| `confirm` | High confidence |
+| `repeat_slowly` | Medium confidence |
+| `spell_last_name` | Low confidence, early attempts |
+| `spell_full_name` | Low + more retries, both sides very uncertain, or missing first/last |
+| `sms_fallback` | `attempt_number >= 6`, or low confidence after many tries |
+
+### `low_confidence_flag`
+
+`true` whenever `confidence` is not `high` (and for incomplete inputs).
+
+### `recovery_strategy`
+
+Short machine-readable tag (e.g. `phonetic_fuzzy_match`, `title_case_fallback_low`, `llm_rerank`) for logging / analytics.
 
 ---
 
-## Retell integration (step-by-step)
+## Retell: store fields as variables
 
-### 1. Deploy this service
+| Response field | Example variable |
+|----------------|------------------|
+| `first_name` | `corrected_first` |
+| `last_name` | `corrected_last` |
+| `full_name` | `corrected_full` |
+| `confidence` | `name_confidence` |
+| `low_confidence_flag` | `needs_spelling` |
+| `next_action` | `next_action` |
+| `recovery_strategy` | `recovery_strategy` |
 
-Any public HTTPS URL works. Quick options:
+Branch the agent on **`next_action`**; use **`low_confidence_flag`** for softer confirmation copy.
 
-| Platform | Command |
-|----------|---------|
-| **Railway** | `railway up` in the `backend/` folder |
-| **Render** | Connect repo, set start command `node server.js` |
-| **Fly.io** | `fly launch` then `fly deploy` |
+---
 
-Your deployed URL will look like `https://your-app.railway.app`.
+## No PHI beyond names
 
-### 2. Add a Custom Function in Retell
-
-1. In Retell, go to **Functions → Add Function**.
-2. Fill in:
-   - **Name**: e.g. `Name correction`
-   - **URL**: `https://your-app.railway.app/correct-name`
-   - **Method**: `POST`
-   - **Header**: `Content-Type` = `application/json`
-3. Pass **`first_name`** and **`last_name`** (body JSON and/or query — both work on POST).
-4. **Store fields as variables** (example):
-
-   | Response field | Variable |
-   |----------------|----------|
-   | `first_name` | `corrected_first` |
-   | `last_name` | `corrected_last` |
-   | `full_name` | `corrected_full` |
-   | `low_confidence_flag` | `needs_spelling` |
-
-### 3. Wire it into your call flow
-
-If `needs_spelling` is false → normal confirmation with `corrected_first` / `corrected_last`.  
-If true → spell-out or repeat branch.
-
-### 4. No PHI beyond name
-
-This service accepts and returns **only name fields** plus the boolean flag above.  
-Do not pass DOB, MRN, address, or any other identifiers.
+Do not send DOB, MRN, address, etc. — only name strings (and optional `attempt_number`).
